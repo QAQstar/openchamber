@@ -1,5 +1,5 @@
 import { stat } from 'node:fs/promises';
-import { getRemotes, getStatus } from '../git/index.js';
+import { getRemotes, getTrackingBranch, isAncestorOfHead } from '../git/index.js';
 import { resolveGitHubRepoFromDirectory } from './repo/index.js';
 import { noteIfGitHubRateLimit } from './rate-limit.js';
 
@@ -543,6 +543,25 @@ const searchFallbackPr = async ({ octokit, branch, repoNames }) => {
 
 const isTerminalPr = (pr) => Boolean(pr) && (pr.state === 'closed' || Boolean(pr.merged_at));
 
+// A closed/merged PR is matched by head branch NAME, and names get reused: a
+// fresh worktree called `feature` cut from the default branch would inherit
+// the merged PR of last month's `feature`. The PR only belongs to this checkout
+// when the commit it was merged or closed at is part of the checkout's history.
+const isHistoricalPrOfCheckout = async (directory, pr) => {
+  const headSha = normalizeText(pr?.head?.sha);
+  if (!headSha) {
+    return false;
+  }
+  try {
+    return await isAncestorOfHead(directory, headSha);
+  } catch {
+    return false;
+  }
+};
+
+// Exported for focused unit tests.
+export { isHistoricalPrOfCheckout };
+
 /**
  * Resolve the PRs a branch is associated with in one repo target.
  *
@@ -644,13 +663,13 @@ export async function resolveGitHubPrStatus({ octokit, directory, branch, remote
   const normalizedBranch = normalizeText(branch);
   const normalizedRemoteName = normalizeText(remoteName) || 'origin';
 
-  const [status, remotes] = await Promise.all([
-    getStatus(directory).catch(() => null),
+  const [tracking, remotes] = await Promise.all([
+    getTrackingBranch(directory).catch(() => null),
     getRemotes(directory).catch(() => []),
   ]);
 
-  const trackingRemoteName = parseTrackingRemoteName(status?.tracking);
-  const trackingBranchName = parseTrackingBranchName(status?.tracking);
+  const trackingRemoteName = parseTrackingRemoteName(tracking);
+  const trackingBranchName = parseTrackingBranchName(tracking);
   const branchCandidates = [];
   pushUnique(branchCandidates, normalizedBranch);
   pushUnique(branchCandidates, trackingBranchName);
@@ -674,7 +693,16 @@ export async function resolveGitHubPrStatus({ octokit, directory, branch, remote
     };
   }
 
-  const sourceCandidates = resolvedTargets.slice();
+  // Only the repo this branch actually pushes to (the ranked-first remote)
+  // and its fork network can be the SOURCE of the branch's PRs. Other
+  // configured remotes — a maintainer's checkout often carries contributor
+  // forks — are places to look for an open PR, but their `owner:branch`
+  // heads are unrelated branches that merely share a name; treating them as
+  // sources made a fork's closed `main` PR show up on the local main.
+  const primaryRemoteName = resolvedTargets[0]?.remoteName ?? null;
+  const sourceCandidates = resolvedTargets.filter(
+    (target) => target.remoteName === primaryRemoteName,
+  );
   // When every consulted repo list was complete, a no-PR result is
   // authoritative and the expensive Search API fallback is pointless.
   const coverage = { authoritative: true };
@@ -755,7 +783,7 @@ export async function resolveGitHubPrStatus({ octokit, directory, branch, remote
     }
   }
 
-  if (historicalMatch) {
+  if (historicalMatch && await isHistoricalPrOfCheckout(directory, historicalMatch.pr)) {
     return historicalMatch;
   }
 

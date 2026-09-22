@@ -51,7 +51,7 @@ export const SettingsPageLayout: React.FC<SettingsPageLayoutProps> = ({
 
   return (
     <ScrollableOverlay
-      outerClassName={cn('h-full', outerClassName)}
+      outerClassName={cn('h-full overlay-scrollbar-wrapper--stable-gutter', outerClassName)}
       className="w-full @container"
     >
       <div
@@ -75,13 +75,13 @@ export const SettingsPageLayout: React.FC<SettingsPageLayoutProps> = ({
                   hasTitleChrome ? (
                     <div className="flex min-w-0 items-center gap-2">
                       {titleLeading}
-                      <h1 className={cn(SETTINGS_PAGE_TITLE_CLASS, 'min-w-0 truncate')}>{title}</h1>
+                      <h1 data-settings-page-heading tabIndex={-1} className={cn(SETTINGS_PAGE_TITLE_CLASS, 'min-w-0 truncate')}>{title}</h1>
                       {/* A status badge carries a fixed word; compressing it
                           wraps the text inside its own pill. */}
                       <span className="shrink-0">{titleAccessory}</span>
                     </div>
                   ) : (
-                    <h1 className={SETTINGS_PAGE_TITLE_CLASS}>{title}</h1>
+                    <h1 data-settings-page-heading tabIndex={-1} className={SETTINGS_PAGE_TITLE_CLASS}>{title}</h1>
                   )
                 ) : (
                   title
