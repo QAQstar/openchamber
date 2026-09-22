@@ -1,0 +1,47 @@
+name: Build v2 preview image
+
+# 手动触发：Actions -> Build v2 preview image -> Run workflow
+# 只构建并推送 ghcr.io/<owner>/openchamber:v2-preview，不动 :latest
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 直接取上游 v2 分支源码（无需同步/合并你的 fork）
+      # 如需固定版本，把 ref 换成 commit：33a4de2eadadc8f9567800509c284b4213199fde
+      - name: Checkout upstream v2 source
+        uses: actions/checkout@v4
+        with:
+          repository: openchamber/openchamber
+          ref: opencode-v2-refactoring
+          fetch-depth: 1
+
+      - name: Convert repository owner to lowercase
+        run: |
+          echo "OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ env.OWNER_LOWER }}/openchamber:v2-preview
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
