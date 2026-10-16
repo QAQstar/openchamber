@@ -11,6 +11,9 @@ import { createRegistryToolsSource, readHostToolVersions } from '../tools.js';
 import { SPACE_BASE_IMAGE, createDockerPlace } from './docker.js';
 
 export const LIVE_DOCKER_ENABLED = process.env.OPENCHAMBER_TEST_DOCKER === '1';
+// With `OPENCHAMBER_TEST_DOCKER_HOST=ssh://<machine>` every live suite runs against that machine's
+// daemon through the Docker over SSH place, helpers included; unset, against the local one.
+const LIVE_DOCKER_HOST = process.env.OPENCHAMBER_TEST_DOCKER_HOST || null;
 
 const LISTINGS = [
   ['ps', '--all', '--format', '{{.Names}}'],
@@ -30,16 +33,17 @@ require('node:net').createServer((socket) => { socket.on('error', () => {}); soc
  * The owner also gets a tools volume of its own, so the first create of every live file pays for one fill.
  * `placeWith(toolsSource)` makes another place for the same owner, as a host with other tools would be.
  */
-export function createLiveDockerPlace({ toolsSource = createRegistryToolsSource(readHostToolVersions()) } = {}) {
+export function createLiveDockerPlace({ toolsSource = createRegistryToolsSource(readHostToolVersions()), dockerHost = LIVE_DOCKER_HOST } = {}) {
   const owner = `test-${crypto.randomBytes(6).toString('hex')}`;
-  const placeWith = (source) => createDockerPlace({ runCommand, dockerPath: 'docker', owner, toolsSource: source });
+  const placeWith = (source) => createDockerPlace({ runCommand, dockerPath: 'docker', dockerHost, owner, toolsSource: source });
   const place = placeWith(toolsSource);
   const ownerFilter = ['--filter', `label=${LABEL_MARKER}`, '--filter', `label=${LABEL_OWNER}=${owner}`];
   // Helper containers carry the marker and the owner, so the leftover check sees them. They have no space id.
   const helperLabels = ['--label', `${LABEL_MARKER}=true`, '--label', `${LABEL_OWNER}=${owner}`];
 
+  const hostArgs = dockerHost === null ? [] : ['--host', dockerHost];
   const docker = async (args, options) => {
-    const result = await runCommand('docker', args, options);
+    const result = await runCommand('docker', [...hostArgs, ...args], options);
     expect(result.code, `docker ${args[0]}: ${result.stderr}`).toBe(0);
     return result;
   };
@@ -118,13 +122,29 @@ export function createLiveDockerPlace({ toolsSource = createRegistryToolsSource(
 const crypto = require('node:crypto');
 const hash = (value) => (value === undefined ? 'none' : 'sha256:' + crypto.createHash('sha256').update(String(value)).digest('hex'));
 require('node:http').createServer((request, response) => {
-  response.writeHead(200, { 'content-type': 'application/json' });
-  response.end(JSON.stringify({
+  const seen = {
+    method: request.method,
     path: request.url,
     authorization: hash(request.headers.authorization),
     apiKey: hash(request.headers['x-api-key']),
+    // A header of the user's own, as a custom provider's grant sets it beside the key.
+    team: hash(request.headers['x-team']),
     headerNames: Object.keys(request.headers).sort(),
-  }));
+  };
+  // One line per request in the container's log, so the host can read what a client it does
+  // not control, OpenCode inside a space, sent here. Hashes only, as in the answer.
+  console.log('seen ' + JSON.stringify(seen));
+  // GitHub Copilot's plugin in OpenCode asks for the model list before any turn and takes it in
+  // GitHub's own shape only: one model, enough for a turn to go through the window.
+  const models = request.method === 'GET' && request.url.split('?')[0].endsWith('/models');
+  const body = models
+    ? { data: [{ model_picker_enabled: true, id: 'gpt-4o', name: 'GPT-4o', version: 'gpt-4o-2024-11-20', capabilities: { family: 'gpt-4o', limits: { max_output_tokens: 4096, max_prompt_tokens: 64000 }, supports: { tool_calls: true, streaming: true } } }] }
+    : seen;
+  request.resume();
+  request.on('end', () => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(body));
+  });
 }).listen(9000, '0.0.0.0', () => console.log('upstream listening'));
 `;
       await docker([
@@ -136,8 +156,23 @@ require('node:http').createServer((request, response) => {
         await new Promise((resolve) => { setTimeout(resolve, 250); });
         if ((await docker(['logs', name])).stdout.includes('upstream listening')) break;
       }
-      return { url: 'http://upstream:9000/v1', stop: () => docker(['rm', '--force', name]) };
+      return {
+        url: 'http://upstream:9000/v1',
+        /** Every request this upstream has seen so far, oldest first, from its log. */
+        seen: async () => (await docker(['logs', name])).stdout.split('\n').filter((line) => line.startsWith('seen ')).map((line) => JSON.parse(line.slice(5))),
+        stop: () => docker(['rm', '--force', name]),
+      };
     },
+
+    /**
+     * Runs a Node script in a helper container on the space's outer network, where the stand-in
+     * upstream sits and where, on a Linux host, the host's own processes can reach. What such a
+     * neighbour can reach on the gatekeeper is what the gatekeeper's bind address decides.
+     */
+    probeFromOuterNetwork: (spaceId, script) => docker(
+      ['run', '--rm', ...helperLabels, '--network', spaceResourceName(spaceId, ROLE_OUTER_NETWORK), SPACE_BASE_IMAGE, 'node', '-e', script],
+      { timeoutMs: 120_000 },
+    ),
 
     /**
      * A name of our own in the space's outer network, answered by Docker's embedded resolver with

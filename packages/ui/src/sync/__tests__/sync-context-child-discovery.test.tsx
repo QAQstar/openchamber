@@ -57,6 +57,7 @@ const sdkIdentity = {}
 mock.module('@/lib/opencode/client', () => ({
   ascendingId: (prefix: string) => `${prefix}_${(sequence += 1).toString().padStart(6, '0')}`,
   isOpencodeNotFound: () => false,
+  OpencodeApiError: Error,
   normalizeOpencodeError: (operation: string, error: unknown) => new Error(`${operation}: ${String(error)}`),
   OPENCODE_DIRECTORY_HEADER: 'x-opencode-directory',
   opencodeClient: {
@@ -66,6 +67,7 @@ mock.module('@/lib/opencode/client', () => ({
     getDirectory: () => DIRECTORY,
     setDirectory: () => undefined,
     clearConfigCache: () => undefined,
+    learnMessagePageShellsSupport: () => undefined,
     listProjects: async () => [],
     getFilesystemHome: async () => '/home',
     getLocation: async () => ({

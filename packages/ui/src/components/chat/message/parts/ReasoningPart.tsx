@@ -4,21 +4,23 @@ import type { Part } from '@/lib/opencode/model';
 import { cn } from '@/lib/utils';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { Icon } from '@/components/icon/Icon';
+import type { IconName } from '@/components/icon/icons';
 import { BusyDots } from './BusyDots';
+import { BlockLine } from './BlockLine';
 import { useI18n } from '@/lib/i18n';
 import { useUIStore } from '@/stores/useUIStore';
 import { MarkdownRenderer } from '../../MarkdownRenderer';
+import type { MarkdownVariant } from '../../MarkdownRendererImpl';
 import { useStreamingTextThrottle } from '../../hooks/useStreamingTextThrottle';
 import { commitStreamedText } from '../../lib/streamTextCommit';
 import type { StreamPhase } from '../types';
+import { useReasoningReveal } from '@/components/chat/search/reasoningReveal';
 
 const TOOL_ROW_TEXT_CLASS = '!text-[length:var(--text-meta)] !leading-5 sm:!leading-6 tracking-normal';
 const TOOL_ROW_TITLE_CLASS = cn('typography-meta font-medium', TOOL_ROW_TEXT_CLASS);
 const TOOL_ROW_DESCRIPTION_CLASS = cn('typography-meta', TOOL_ROW_TEXT_CLASS);
 
 type PartWithText = Part & { text?: string; content?: string; time?: { start?: number; end?: number } };
-
-type ReasoningVariant = 'thinking' | 'justification';
 
 const cleanReasoningText = (text: string): string => {
     if (typeof text !== 'string' || text.trim().length === 0) {
@@ -80,14 +82,35 @@ const getReasoningSummary = (text: string): string => {
 
 type ReasoningTimelineBlockProps = {
     text: string;
-    variant: ReasoningVariant;
     blockId: string;
     time?: { start?: number; end?: number };
-    showDuration?: boolean;
     isStreaming?: boolean;
     actions?: React.ReactNode;
     /** Override the initial expanded state. Defaults to `isStreaming`. */
     defaultExpanded?: boolean;
+    /**
+     * Opens while it streams and folds when it ends. Off keeps a streaming
+     * block folded to its header, so a block closing does not move the chat.
+     */
+    expandWhileStreaming?: boolean;
+    /** Opens the block whenever it changes to a new non-zero value (a search hit in it). */
+    revealRequest?: number;
+    /** The message this reasoning belongs to; search finds and highlights the block by it. */
+    reasoningMessageId?: string;
+    /**
+     * Presentation for rows that borrow this block for something other than
+     * reasoning (a compaction summary): its own icon, title, toggle labels,
+     * body typography and box height.
+     */
+    presentation?: {
+        icon: IconName;
+        iconClassName?: string;
+        title: string;
+        expandLabel: string;
+        collapseLabel: string;
+        markdownVariant: MarkdownVariant;
+        maxHeightClassName: string;
+    };
 };
 
 type ExpansionState = {
@@ -97,16 +120,19 @@ type ExpansionState = {
 
 export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
     text,
-    variant,
     blockId,
     time,
     isStreaming = false,
     actions,
     defaultExpanded,
+    expandWhileStreaming = true,
+    revealRequest = 0,
+    reasoningMessageId,
+    presentation,
 }) => {
     const { t } = useI18n();
     const hasEnded = typeof time?.end === 'number';
-    const canAutoExpand = isStreaming && !hasEnded;
+    const canAutoExpand = expandWhileStreaming && isStreaming && !hasEnded;
     const [expansion, setExpansion] = React.useState<ExpansionState>(() => {
         if (defaultExpanded === true) {
             return { expanded: true, source: 'user' };
@@ -117,6 +143,14 @@ export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
         ? canAutoExpand && expansion.expanded
         : expansion.expanded;
     const [shouldRenderExpandedContent, setShouldRenderExpandedContent] = React.useState(defaultExpanded === true || canAutoExpand);
+    // Adjusted during render so the opened body is in the DOM on the first
+    // commit, where the search highlight looks for it.
+    const [handledReveal, setHandledReveal] = React.useState(0);
+    if (revealRequest !== 0 && revealRequest !== handledReveal) {
+        setHandledReveal(revealRequest);
+        setExpansion({ expanded: true, source: 'user' });
+        setShouldRenderExpandedContent(true);
+    }
     const contentId = React.useId();
     const contentRef = React.useRef<HTMLDivElement>(null);
     const contentAnimationRef = React.useRef<AnimationPlaybackControls | null>(null);
@@ -187,8 +221,9 @@ export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
 
     const summary = React.useMemo(() => getReasoningSummary(text), [text]);
     const toggleAriaLabel = isExpanded
-        ? t('chat.reasoningTrace.collapseAria')
-        : t('chat.reasoningTrace.expandAria');
+        ? presentation?.collapseLabel ?? t('chat.reasoningTrace.collapseAria')
+        : presentation?.expandLabel ?? t('chat.reasoningTrace.expandAria');
+    const title = presentation?.title ?? t('chat.reasoningTrace.thinking');
 
     const handleToggle = React.useCallback(() => {
         setShouldRenderExpandedContent(true);
@@ -340,7 +375,7 @@ export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
                     messageId={blockId}
                     isAnimated={false}
                     isStreaming={isStreaming}
-                    variant="reasoning"
+                    variant={presentation?.markdownVariant ?? 'reasoning'}
                 />
             </div>
             {actions ? (
@@ -354,7 +389,7 @@ export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
     );
 
     return (
-        <div data-reasoning-block-id={blockId} data-message-text-export-root="true">
+        <div data-reasoning-block-id={blockId} data-reasoning-message-id={reasoningMessageId} data-message-text-export-root="true">
             <div
                 role="button"
                 tabIndex={0}
@@ -362,7 +397,7 @@ export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
                 aria-controls={contentId}
                 aria-label={toggleAriaLabel}
                 className={cn(
-                    'group/tool flex gap-1.5 pr-2 pl-px py-1.5 rounded-xl cursor-pointer items-center',
+                    'group/tool flex gap-1.5 pe-2 ps-px py-1.5 rounded-xl cursor-pointer items-center',
                 )}
                 onClick={handleToggle}
                 onKeyDown={handleKeyDown}
@@ -377,7 +412,7 @@ export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
                             )}
                             style={{ color: 'var(--tools-icon)' }}
                         >
-                            <Icon name="brain-ai-3" className="h-3.5 w-3.5" />
+                            <Icon name={presentation?.icon ?? 'brain-ai-3'} className={cn('h-3.5 w-3.5', presentation?.iconClassName)} />
                         </div>
                         <div
                             className={cn(
@@ -393,22 +428,15 @@ export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
 
                     {isStreaming ? (
                         <span className={cn('flex items-center gap-1', TOOL_ROW_TITLE_CLASS)} style={{ color: 'var(--tools-title)' }}>
-                            <span>{t(variant === 'justification' ? 'chat.reasoningTrace.justification' : 'chat.reasoningTrace.thinking')}</span>
+                            <span>{title}</span>
                             <BusyDots />
-                        </span>
-                    ) : isExpanded ? (
-                        <span
-                            className={TOOL_ROW_TITLE_CLASS}
-                            style={{ color: 'var(--tools-title)' }}
-                        >
-                            {t(variant === 'justification' ? 'chat.reasoningTrace.justification' : 'chat.reasoningTrace.thinking')}
                         </span>
                     ) : (
                         <span
                             className={TOOL_ROW_TITLE_CLASS}
                             style={{ color: 'var(--tools-title)' }}
                         >
-                            {t(variant === 'justification' ? 'chat.reasoningTrace.justification' : 'chat.reasoningTrace.thinking')}
+                            {title}
                         </span>
                     )}
                 </div>
@@ -440,22 +468,18 @@ export const ReasoningTimelineBlock: React.FC<ReasoningTimelineBlockProps> = ({
                     }}
                 >
                     <div
-                        className="relative ml-2 pl-3 pb-1 pt-0.5"
+                        className="relative ms-2 ps-3 pb-1 pt-0.5"
                         style={{
                             opacity: isExpanded ? 1 : 0,
                             transform: isExpanded ? 'translateY(0)' : 'translateY(-4px)',
                             transition: 'opacity 180ms ease-out, transform 180ms ease-out',
                         }}
                     >
-                        <span
-                            aria-hidden="true"
-                            className="pointer-events-none absolute left-0 top-0 bottom-0 w-px"
-                            style={{ backgroundColor: 'var(--tools-border)' }}
-                        />
+                        <BlockLine onToggle={handleToggle} />
                         <ScrollableOverlay
                             ref={scrollBoxRef}
                             as="div"
-                            outerClassName="max-h-80"
+                            outerClassName={presentation?.maxHeightClassName ?? 'max-h-80'}
                             className="p-0"
                             useScrollShadow
                             scrollShadowSize={36}
@@ -486,7 +510,8 @@ const ReasoningPart = React.memo(({
     messageId,
     streamPhase,
 }: ReasoningPartProps) => {
-    const chatRenderMode = useUIStore((state) => state.chatRenderMode);
+    const expandWhileStreaming = useUIStore((state) => state.expandReasoningWhileStreaming);
+    const revealRequest = useReasoningReveal(messageId);
     const partWithText = part as PartWithText;
     const rawText = partWithText.text || partWithText.content || '';
     const textContent = React.useMemo(() => cleanReasoningText(rawText), [rawText]);
@@ -496,7 +521,7 @@ const ReasoningPart = React.memo(({
     // the message finished long ago (issue #2020). A part that has ended is
     // never streaming, even while the rest of the message still streams.
     const isLiveStreamPhase = streamPhase === 'streaming' || streamPhase === 'cooldown';
-    const isStreaming = chatRenderMode === 'live' && isLiveStreamPhase && typeof time?.end !== 'number';
+    const isStreaming = isLiveStreamPhase && typeof time?.end !== 'number';
     const throttledTextRaw = useStreamingTextThrottle({
         text: textContent,
         isStreaming,
@@ -517,10 +542,12 @@ const ReasoningPart = React.memo(({
     return (
         <ReasoningTimelineBlock
             text={throttledText}
-            variant="thinking"
             blockId={part.id || `${messageId}-reasoning`}
             time={time}
             isStreaming={isStreaming}
+            expandWhileStreaming={expandWhileStreaming}
+            revealRequest={revealRequest}
+            reasoningMessageId={messageId}
         />
     );
 });

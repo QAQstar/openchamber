@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { SpaceError } from '../errors.js';
 import { GATEKEEPER_PROGRAM } from '../gatekeeper-channel.js';
 import { buildSpaceLabels, buildToolsLabels, hashProjectDirectory } from '../labels.js';
-import { SPACE_ENVIRONMENT, SPACE_SERVER_COMMAND } from '../layout.js';
+import { SPACE_CONNECT_COMMAND, SPACE_ENVIRONMENT, SPACE_IDLE_EXIT_CODE, SPACE_SERVER_COMMAND } from '../layout.js';
 import { createRegistryToolsSource, toolsContentKey } from '../tools.js';
 import { SPACE_BASE_IMAGE, createDockerPlace } from './docker.js';
 import { bridgeNetworkEntry, createFakeDocker, hardenedContainerEntry, internalNetworkEntry } from './fake-docker.js';
@@ -27,7 +27,7 @@ const NOW = new Date('2026-09-20T08:00:00.000Z');
 /** A place on a plain runner, for the tests that wrap or replace the fake. */
 const placeOn = (runCommand, options = {}) => createDockerPlace({ runCommand, dockerPath: 'docker', owner: OWNER, toolsSource: SOURCE, now: () => NOW, ...options });
 
-const makePlace = (fake, owner = OWNER, toolsSource = SOURCE) => placeOn(fake.runCommand, { dockerPath: '/usr/bin/docker', owner, toolsSource, wait: fake.wait, now: fake.now });
+const makePlace = (fake, owner = OWNER, toolsSource = SOURCE, options = {}) => placeOn(fake.runCommand, { dockerPath: '/usr/bin/docker', owner, toolsSource, wait: fake.wait, now: fake.now, ...options });
 
 const labelsFor = (role, { id = ID, owner = OWNER } = {}) => buildSpaceLabels({ ...SPEC, id, role, owner });
 
@@ -180,6 +180,14 @@ describe('docker place: check', () => {
     expect(result.message).toMatch(/Start Docker Desktop or Colima/);
   });
 
+  it('tells a socket that refuses this user from a daemon that is down', async () => {
+    const stdout = JSON.stringify({ Client: { Version: '29.3.0' }, Server: null });
+    const stderr = 'permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.47/version": dial unix /var/run/docker.sock: connect: permission denied';
+    const result = await placeWith(async () => ({ code: 1, stdout, stderr })).check();
+    expect(result).toMatchObject({ available: false, code: 'docker_permission_denied' });
+    expect(result.message).toMatch(/docker group/);
+  });
+
   it('says the daemon is unreachable on a timeout', async () => {
     const place = placeWith(async () => { throw new SpaceError('command_timeout', 'too slow'); });
     expect((await place.check()).code).toBe('docker_daemon_unreachable');
@@ -234,6 +242,7 @@ describe('docker place: create', () => {
       '--env', 'OPENCODE_DISABLE_MODELS_FETCH=1',
       '--env', 'OPENCODE_DISABLE_AUTOUPDATE=1',
       '--env', 'OPENCHAMBER_RELAY_HOST=off',
+      '--env', 'OPENCHAMBER_SPACE_IDLE_STOP_FILE=/home/space/.openchamber-space/idle-stop.json',
       SPACE_BASE_IMAGE,
       '/bin/sh', '-c',
       'while [ ! -s /home/space/.openchamber-space/token ]; do /bin/sleep 0.2; done; OPENCHAMBER_UI_PASSWORD="$(/bin/cat /home/space/.openchamber-space/token)"; export OPENCHAMBER_UI_PASSWORD; exec openchamber serve --foreground --api-only --host 127.0.0.1 --port 27600',
@@ -269,16 +278,26 @@ describe('docker place: create', () => {
       '--log-opt', 'compress=false',
       '--network', NETWORK,
       '--network-alias', 'gatekeeper',
+      // The Docker host by name, for a provider that listens on that machine's loopback.
+      '--add-host', 'host.docker.internal:host-gateway',
       '--env', 'HOME=/tmp',
       SPACE_BASE_IMAGE,
       '/bin/sh', '-c',
-      'while [ ! -s /tmp/openchamber-gatekeeper/gatekeeper.cjs ]; do /bin/sleep 0.2; done; exec /usr/local/bin/node /tmp/openchamber-gatekeeper/gatekeeper.cjs 0.0.0.0 3128 8080 9099 300000 128 64 8',
+      // The bind host is the file the host writes after the start, holding the gatekeeper's own
+      // address on the space's network, never every interface: see "Known limits" of stage 2.
+      'while [ ! -s /tmp/openchamber-gatekeeper/gatekeeper.cjs ]; do /bin/sleep 0.2; done; exec /usr/local/bin/node /tmp/openchamber-gatekeeper/gatekeeper.cjs /tmp/openchamber-gatekeeper/bind 3128 8080 9099 300000 128 64 8',
     ]);
     expect(create).toContain('openchamber.space.role=gatekeeper');
     expect(create).not.toContain('--mount');
     // The program travels on stdin, so it is in no argument list, and no secret is in one either.
     const write = fake.calls.find((call) => isExec('gatekeeper.cjs.new')(call.args));
     expect(write.options.stdin).toBe(GATEKEEPER_PROGRAM);
+    // The address the fake engine gives the gatekeeper on the inner network, read after the start
+    // and written into the bind file before the program.
+    expect(write.args.slice(-2)).toEqual(['sh', '172.19.0.2']);
+    expect(write.args.join(' ')).toContain('> /tmp/openchamber-gatekeeper/bind.new && mv /tmp/openchamber-gatekeeper/bind.new /tmp/openchamber-gatekeeper/bind && cat > /tmp/openchamber-gatekeeper/gatekeeper.cjs.new');
+    const order = fake.calls.map((call) => describeCall(call.args));
+    expect(order.indexOf(`start ${GATEKEEPER}`)).toBeLessThan(order.indexOf('exec write program'));
     expect(write.args[4]).toBe(GATEKEEPER);
   });
 
@@ -341,6 +360,16 @@ describe('docker place: create', () => {
     }
   });
 
+  it('names the slow parts it does as they begin, and none it skips', async () => {
+    const fresh = [];
+    await makePlace(createFakeDocker({ imagePresent: false })).create(SPEC, { onStep: (step) => fresh.push(step) });
+    expect(fresh).toEqual(['downloading_image', 'preparing_tools', 'creating']);
+
+    const ready = [];
+    await makePlace(createFakeDocker({ resources: [toolsResource()] })).create(SPEC, { onStep: (step) => ready.push(step) });
+    expect(ready).toEqual([]);
+  });
+
   it('pulls the image, fills the tools, then makes the space, starts it, and waits for its server', async () => {
     const fake = createFakeDocker({ imagePresent: false });
     await makePlace(fake).create(SPEC);
@@ -381,6 +410,16 @@ describe('docker place: create', () => {
       expect(call.file).toBe('/usr/bin/docker');
       expect(call.options.timeoutMs).toBeGreaterThan(0);
     }
+  });
+
+  it('passes the output window and the tree kill of an exec to the runner, and nothing it was not given', async () => {
+    const fake = createFakeDocker();
+    const place = makePlace(fake);
+    await place.create(SPEC);
+    await place.exec(SPEC.id, ['/bin/true'], { timeoutMs: 5_000, maxOutputBytes: 1024, keepTail: true, killTree: true });
+    expect(fake.calls.at(-1).options).toEqual({ stdin: '', timeoutMs: 5_000, maxOutputBytes: 1024, keepTail: true, killTree: true });
+    await place.exec(SPEC.id, ['/bin/true']);
+    expect(fake.calls.at(-1).options).toEqual({ stdin: '', timeoutMs: 60_000 });
   });
 
   it('refuses when a resource with the same name exists, and touches nothing', async () => {
@@ -608,9 +647,9 @@ describe('docker place: list', () => {
 
     const spaces = await makePlace(fake).list();
     expect(spaces).toEqual([
-      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', orphans: [], damaged: false, missing: [] },
-      { id: '111111111111', name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'exited', orphans: [], damaged: false, missing: [] },
-      { id: orphanId, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'missing', orphans: [{ kind: 'volume', name: orphanVolume }], damaged: false, missing: [] },
+      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, orphans: [], damaged: false, missing: [] },
+      { id: '111111111111', name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'exited', stoppedIdle: false, gatekeeperRunning: false, orphans: [], damaged: false, missing: [] },
+      { id: orphanId, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'missing', stoppedIdle: false, gatekeeperRunning: false, orphans: [{ kind: 'volume', name: orphanVolume }], damaged: false, missing: [] },
     ]);
   });
 
@@ -618,14 +657,14 @@ describe('docker place: list', () => {
     const fake = createFakeDocker({ resources: spaceResources().filter((resource) => resource.name !== HOME && resource.kind !== 'network') });
 
     expect(await makePlace(fake).list()).toEqual([
-      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', orphans: [], damaged: true, missing: [NETWORK, OUTER_NETWORK, HOME] },
+      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, orphans: [], damaged: true, missing: [NETWORK, OUTER_NETWORK, HOME] },
     ]);
   });
 
   it('flags a running space whose gatekeeper is gone, or does not run, as damaged and not as missing', async () => {
     const withoutGatekeeper = createFakeDocker({ resources: spaceResources().filter((resource) => resource.name !== GATEKEEPER) });
     expect(await makePlace(withoutGatekeeper).list()).toEqual([
-      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', orphans: [], damaged: true, missing: [GATEKEEPER] },
+      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: false, orphans: [], damaged: true, missing: [GATEKEEPER] },
     ]);
 
     // The space runs and its way out does not. For the space that is as good as no gatekeeper.
@@ -637,6 +676,17 @@ describe('docker place: list', () => {
     // A stopped space with a stopped gatekeeper is whole: `start` brings both up in order.
     const bothStopped = createFakeDocker({ resources: spaceResources({ running: false }) });
     expect(await makePlace(bothStopped).list()).toMatchObject([{ state: 'exited', damaged: false, missing: [] }]);
+  });
+
+  it('tells a space that stopped itself for the idle stop by its exit code, and a gatekeeper left running beside it', async () => {
+    const seeds = spaceResources();
+    const space = seeds.find((resource) => resource.kind === 'container' && resource.name === `openchamber-space-${ID}-space`);
+    space.entry.State = { Running: false, Status: 'exited', ExitCode: SPACE_IDLE_EXIT_CODE };
+    expect(await makePlace(createFakeDocker({ resources: seeds })).list()).toMatchObject([{ state: 'exited', stoppedIdle: true, gatekeeperRunning: true, damaged: false, missing: [] }]);
+
+    // Stopped by `docker stop`: the server ends on SIGTERM with 143, which is no idle stop.
+    space.entry.State = { Running: false, Status: 'exited', ExitCode: 143 };
+    expect(await makePlace(createFakeDocker({ resources: seeds })).list()).toMatchObject([{ state: 'exited', stoppedIdle: false }]);
   });
 
   it('still lists the other spaces when a resource vanishes between the listing and the inspect', async () => {
@@ -831,6 +881,37 @@ describe('docker place: exec, stop, start, verify', () => {
       ? { ...resource, name: `${CONTAINER}-old`, entry: { ...resource.entry, Name: `/${CONTAINER}-old` } }
       : resource));
     await expect(makePlace(createFakeDocker({ resources: aside })).execArgv(ID)).rejects.toMatchObject({ code: 'space_move_unfinished' });
+  });
+
+  // Added in stage 4a. `connect` runs the bridge of layout.js over the argv of `execArgv`, through
+  // the injected stream opener, so the same checks come first and no process starts in a unit test.
+  it('connects through the bridge inside the space container, over the exec argv, and changes nothing', async () => {
+    const fake = createFakeDocker({ resources: spaceResources() });
+    const opened = [];
+    const stream = { destroyed: false };
+    const place = makePlace(fake, OWNER, SOURCE, { openCommandStream: (file, args) => { opened.push([file, ...args]); return stream; } });
+
+    expect(await place.connect(ID)).toBe(stream);
+    expect(opened).toEqual([['/usr/bin/docker', 'exec', '--interactive', '--user', '1000:1000', CONTAINER, ...SPACE_CONNECT_COMMAND]]);
+    expect(SPACE_CONNECT_COMMAND.slice(0, 2)).toEqual(['/usr/local/bin/node', '-e']);
+    expect(SPACE_CONNECT_COMMAND.slice(-2)).toEqual(['127.0.0.1', '27600']);
+    expect(SPACE_CONNECT_COMMAND.join(' ')).not.toMatch(/\n/);
+    expect(changes(fake)).toEqual([]);
+  });
+
+  it('connects to no stopped space, no stranger\'s container, no space of another installation, none that is missing or mid-move', async () => {
+    const opened = [];
+    const connectWith = (fake) => makePlace(fake, OWNER, SOURCE, { openCommandStream: (...args) => { opened.push(args); return {}; } }).connect(ID);
+    await expect(connectWith(createFakeDocker({ resources: spaceResources({ running: false }) }))).rejects.toMatchObject({ code: 'space_not_running' });
+    const stranger = hardenedContainerEntry({ name: CONTAINER, labels: {}, network: NETWORK, volumes: [] });
+    await expect(connectWith(createFakeDocker({ resources: [{ kind: 'container', name: CONTAINER, entry: stranger }] }))).rejects.toMatchObject({ code: 'space_not_ours' });
+    await expect(connectWith(createFakeDocker({ resources: spaceResources({ owner: 'install-b' }) }))).rejects.toMatchObject({ code: 'space_not_ours' });
+    await expect(connectWith(createFakeDocker())).rejects.toMatchObject({ code: 'space_not_found' });
+    const aside = spaceResources({ running: false }).map((resource) => (resource.name === CONTAINER
+      ? { ...resource, name: `${CONTAINER}-old`, entry: { ...resource.entry, Name: `/${CONTAINER}-old` } }
+      : resource));
+    await expect(connectWith(createFakeDocker({ resources: aside }))).rejects.toMatchObject({ code: 'space_move_unfinished' });
+    expect(opened).toEqual([]);
   });
 
   it('stops the space, starts the same container again, and waits for its server', async () => {
@@ -1337,7 +1418,7 @@ describe('docker place: new tools at the next start', () => {
     expect(fake.token(CONTAINER)).toBe('seeded-token');
     expect(await place.verify(ID)).toEqual([]);
     expect(await place.list()).toEqual([
-      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', orphans: [], damaged: false, missing: [] },
+      { id: ID, name: SPEC.name, project: SPEC.project, created: SPEC.created, state: 'running', stoppedIdle: false, gatekeeperRunning: true, orphans: [], damaged: false, missing: [] },
     ]);
     const create = fake.calls.map((call) => call.args).find((args) => args[0] === 'create');
     expect(create[create.indexOf('--memory') + 1]).toBe('4294967296');
@@ -1605,6 +1686,75 @@ describe('docker place: new tools at the next start', () => {
       const result = await makePlace(fake).remove(ID);
       expect(result.failed).toEqual([]);
       expect(fake.names().filter((name) => name.startsWith('container:'))).toEqual([]);
+    });
+  });
+});
+
+// The Docker over SSH place: the same place, with every command sent to another machine's daemon.
+describe('docker place over SSH', () => {
+  const HOST = 'ssh://me@debian-box';
+  /** The fake docker behind a runner that demands the host flag first and takes it off before the fake reads the argv. */
+  const remoteFake = () => {
+    const fake = createFakeDocker({ resources: [toolsResource(), ...spaceResources()] });
+    const withoutHost = [];
+    const runCommand = (file, args, options) => {
+      if (args[0] !== '--host' || args[1] !== HOST) withoutHost.push(args.slice(0, 3));
+      return fake.runCommand(file, args.slice(2), options);
+    };
+    return { fake, runCommand, withoutHost };
+  };
+  const remotePlace = (runCommand, fake, options = {}) => placeOn(runCommand, { dockerPath: '/usr/bin/docker', dockerHost: HOST, id: 'docker-ssh', wait: fake.wait, now: fake.now, ...options });
+
+  it('carries its own id, and gives the host flag to every docker call of a create, a list, a stop and a start', async () => {
+    const { fake, runCommand, withoutHost } = remoteFake();
+    const place = remotePlace(runCommand, fake);
+    expect(place.id).toBe('docker-ssh');
+    // The machine as the user wrote it, for the screens; the local place names none.
+    expect(place.machine).toBe('me@debian-box');
+    expect(placeOn(runCommand, { dockerPath: '/usr/bin/docker', wait: fake.wait, now: fake.now }).machine).toBeNull();
+    await place.create({ ...SPEC, id: 'b1b2c3d4e5f6' });
+    expect((await place.list()).map((space) => space.id).sort()).toEqual([ID, 'b1b2c3d4e5f6']);
+    await place.stop(ID);
+    await place.start(ID);
+    expect(await place.exec(ID, ['/bin/true'])).toMatchObject({ code: 0 });
+    expect(await place.readDisk()).toMatchObject({ imageBytes: expect.any(Number) });
+    expect(fake.calls.length).toBeGreaterThan(20);
+    expect(withoutHost).toEqual([]);
+  });
+
+  it('hands git and the dispatcher an argv that reaches the remote daemon', async () => {
+    const { fake, runCommand } = remoteFake();
+    const opened = [];
+    const place = remotePlace(runCommand, fake, { openCommandStream: (file, args) => { opened.push([file, ...args]); return {}; } });
+    expect(await place.execArgv(ID)).toEqual(['/usr/bin/docker', '--host', HOST, 'exec', '--interactive', '--user', '1000:1000', CONTAINER]);
+    await place.connect(ID);
+    expect(opened).toEqual([['/usr/bin/docker', '--host', HOST, 'exec', '--interactive', '--user', '1000:1000', CONTAINER, ...SPACE_CONNECT_COMMAND]]);
+  });
+
+  describe('check', () => {
+    const checkWith = (runCommand) => placeOn(runCommand, { dockerPath: '/usr/bin/docker', dockerHost: HOST, id: 'docker-ssh' }).check();
+    const client = JSON.stringify({ Client: { Version: '29.3.0' }, Server: null });
+
+    it('reports the remote engine like the local one', async () => {
+      const answer = async (file, args) => {
+        expect(args.slice(0, 2)).toEqual(['--host', HOST]);
+        return { code: 0, stdout: JSON.stringify(args[2] === 'version' ? { Client: { Version: '29.3.0' }, Server: { Version: '29.8.1', Os: 'linux', Arch: 'amd64' } } : ['name=seccomp,profile=builtin']), stderr: '' };
+      };
+      expect(await checkWith(answer)).toEqual({ available: true, version: '29.8.1', os: 'linux', arch: 'amd64', hostIsolation: true });
+    });
+
+    it('names the machine that did not answer in time', async () => {
+      const result = await checkWith(async () => { throw new SpaceError('command_timeout', 'too slow'); });
+      expect(result).toMatchObject({ available: false, code: 'place_unreachable' });
+      expect(result.message).toBe('me@debian-box did not answer. Check that it is on and reachable over SSH.');
+    });
+
+    it('tells a machine SSH could not reach from one whose Docker is down or missing, by what the CLI said', async () => {
+      const said = (stderr) => checkWith(async () => ({ code: 1, stdout: client, stderr }));
+      expect(await said('error during connect: ... ssh: connect to host debian-box port 22: Operation timed out')).toMatchObject({ code: 'place_unreachable', message: 'Could not reach me@debian-box over SSH. Check the connection, then try again.' });
+      expect(await said('Permission denied (publickey).')).toMatchObject({ code: 'place_unreachable' });
+      expect(await said('error during connect: ... Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?')).toMatchObject({ code: 'docker_daemon_unreachable', message: 'Docker is not running on me@debian-box. Start it there, then try again.' });
+      expect(await said('bash: line 1: docker: command not found')).toMatchObject({ code: 'docker_cli_missing', message: 'Docker is not installed on me@debian-box. Install Docker Engine there, then try again.' });
     });
   });
 });

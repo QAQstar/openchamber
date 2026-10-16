@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { findGatekeeperHardeningViolations, findHardeningViolations, requireMemoryBytes } from './hardening.js';
 import { buildSpaceLabels, buildToolsLabels, hashProjectDirectory } from './labels.js';
+import { SPACE_ENVIRONMENT } from './layout.js';
 import { bridgeNetworkEntry, hardenedContainerEntry, internalNetworkEntry } from './places/fake-docker.js';
 
 const ID = 'a1b2c3d4e5f6';
@@ -78,8 +79,11 @@ describe('findHardeningViolations', () => {
     ['user', { ...goodContainer(), Config: { User: '' } }],
     ['user', { ...goodContainer(), Config: { User: '0:0' } }],
     ['environment', withEnv(['OPENCHAMBER_UI_PASSWORD=secret'])],
-    ['environment', withEnv(['OPENCODE_AUTH_CONTENT={}'])],
     ['environment', withEnv(['OPENCHAMBER_UI_PASSWORD='])],
+    // OpenCode 2 takes a provider key from its environment, directly or inside its config text.
+    ['environment', withEnv(['OPENAI_API_KEY=x'])],
+    ['environment', withEnv(['OPENCODE_CONFIG_CONTENT={"provider":{"groq":{"options":{"apiKey":"x"}}}}'])],
+    ['environment', withEnv(['OPENCODE_CLI_CONFIG_CONTENT={}'])],
     ['read_only', withHost({ ReadonlyRootfs: false })],
     ['privileged', withHost({ Privileged: true })],
     ['cap_drop', withHost({ CapDrop: ['NET_RAW'] })],
@@ -122,6 +126,8 @@ describe('findHardeningViolations', () => {
     ['runtime', withHost({ Runtime: 'sysbox-runc' })],
     ['devices', withHost({ Devices: [{ PathOnHost: '/dev/kvm', PathInContainer: '/dev/kvm' }] })],
     ['port_bindings', withHost({ PortBindings: { '3000/tcp': [{ HostIp: '127.0.0.1', HostPort: '3000' }] } })],
+    // The name of the Docker host is the gatekeeper's, for a provider on that machine; a space has no name to it.
+    ['extra_hosts', withHost({ ExtraHosts: ['host.docker.internal:host-gateway'] })],
   ])('reports %s', (check, container) => {
     expect(checksFor({ container })).toEqual([check]);
   });
@@ -143,8 +149,18 @@ describe('findHardeningViolations', () => {
     expect(checksFor({ container: withHost({ Binds: ['/var/run/docker.sock:/var/run/docker.sock'] }) })).toEqual(['binds', 'runtime_socket']);
   });
 
-  it('accepts harmless variables next to the ones a space gets', () => {
-    expect(checksFor({ container: withEnv(['OPENCODE_DISABLE_AUTOUPDATE=1', 'NOT_OPENCHAMBER_UI_PASSWORD=x']) })).toEqual([]);
+  it('accepts exactly the variables a space gets and the base image sets', () => {
+    const full = withEnv([
+      ...Object.entries(SPACE_ENVIRONMENT).map(([name, value]) => `${name}=${value}`),
+      'NODE_VERSION=24.21.0',
+      'YARN_VERSION=1.22.22',
+    ]);
+    expect(checksFor({ container: full })).toEqual([]);
+  });
+
+  it('refuses any other variable, whatever its name says', () => {
+    const violations = findHardeningViolations({ spaceId: ID, owner: OWNER, container: withEnv(['NOT_OPENCHAMBER_UI_PASSWORD=x']), network: goodNetwork(), toolsVolume: goodToolsVolume() });
+    expect(violations).toEqual([{ check: 'environment', message: 'The container environment holds variables nobody set for it: NOT_OPENCHAMBER_UI_PASSWORD' }]);
   });
 
   describe('tools mount', () => {
@@ -264,6 +280,7 @@ describe('findGatekeeperHardeningViolations', () => {
       memoryBytes: GATEKEEPER_MEMORY,
       tmpfs: '/tmp:rw,noexec,nosuid,size=16m',
       aliases: ['gatekeeper'],
+      extraHosts: ['host.docker.internal:host-gateway'],
     });
     container.NetworkSettings.Networks[OUTER] = {};
     return container;
@@ -295,6 +312,7 @@ describe('findGatekeeperHardeningViolations', () => {
 
   it.each([
     ['gatekeeper_environment', { ...goodGatekeeper(), Config: { ...goodGatekeeper().Config, Env: ['HOME=/tmp', 'OPENCHAMBER_UI_PASSWORD=secret'] } }],
+    ['gatekeeper_environment', { ...goodGatekeeper(), Config: { ...goodGatekeeper().Config, Env: ['HOME=/tmp', 'OPENAI_API_KEY=x'] } }],
     ['gatekeeper_user', { ...goodGatekeeper(), Config: { ...goodGatekeeper().Config, User: '0:0' } }],
     ['gatekeeper_read_only', withGatekeeperHost({ ReadonlyRootfs: false })],
     ['gatekeeper_privileged', withGatekeeperHost({ Privileged: true })],
@@ -319,6 +337,8 @@ describe('findGatekeeperHardeningViolations', () => {
     ['gatekeeper_port_bindings', withGatekeeperHost({ PortBindings: { '3128/tcp': [{ HostPort: '3128' }] } })],
     ['gatekeeper_network_mode', withGatekeeperHost({ NetworkMode: 'bridge' })],
     ['gatekeeper_memory_limit', withGatekeeperHost({ Memory: 4294967296, MemorySwap: 4294967296 })],
+    // The one extra name is the Docker host's; any other is a way to an address nobody granted.
+    ['gatekeeper_extra_hosts', withGatekeeperHost({ ExtraHosts: ['host.docker.internal:host-gateway', 'registry.internal:10.0.0.5'] })],
   ])('reports %s', (check, container) => {
     expect(gatekeeperChecks({ container })).toEqual([check]);
   });

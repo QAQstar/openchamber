@@ -1,5 +1,6 @@
 import React from 'react';
 import type { Agent } from '@/lib/opencode/model';
+import { agentLabel } from '@/lib/agentLabel';
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -45,6 +46,8 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
         if (Array.isArray(configAgents) && configAgents.length > 0) return configAgents;
         return Array.isArray(agentsStoreAgents) ? agentsStoreAgents : [];
     }, [configAgents, agentsStoreAgents, directory]);
+    const selectedAgent = rawAgents.find((agent) => agent.name === agentName);
+    const selectedAgentLabel = selectedAgent ? agentLabel(selectedAgent) : agentName;
     const agents = React.useMemo(() => {
         const visible = filterVisibleAgents(rawAgents);
         return filter ? visible.filter(filter) : visible;
@@ -84,7 +87,7 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
                     <button
                         type="button"
                         className={cn(
-                            'flex w-full items-center justify-between rounded-lg border border-border/40 px-2 py-1.5 text-left',
+                            'flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-start',
                             !agentName ? 'bg-interactive-selection text-interactive-selection-foreground' : 'text-foreground hover:bg-interactive-hover'
                         )}
                         onClick={() => {
@@ -105,7 +108,7 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
                                 key={agent.name}
                                 type="button"
                                 className={cn(
-                                    'flex w-full items-center justify-between rounded-lg border border-border/40 px-2 py-1.5 text-left',
+                                    'flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-start',
                                     isSelected ? 'bg-interactive-selection text-interactive-selection-foreground' : 'text-foreground hover:bg-interactive-hover'
                                 )}
                                 onClick={() => {
@@ -114,7 +117,7 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
                                 }}
                             >
                                 <div className="flex flex-col">
-                                    <span className="typography-meta font-medium">{agent.name}</span>
+                                    <span className="typography-meta font-medium">{agentLabel(agent)}</span>
                                     {agent.description && (
                                         <span className="typography-micro text-muted-foreground">
                                             {agent.description}
@@ -140,7 +143,7 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
                     onClick={isReady ? () => setIsMobilePanelOpen(true) : undefined}
                     disabled={!isReady}
                     className={cn(
-                        dropdownTriggerVariants(),
+                        dropdownTriggerVariants({ size: 'mobile' }),
                         'w-full',
                         className
                     )}
@@ -155,7 +158,7 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
                             <>
                                 <Icon name="robot-2" className="h-3.5 w-3.5 text-muted-foreground" />
                                 <span className="typography-meta font-medium text-foreground">
-                                    {agentName || t('settings.commands.agentSelector.selectAgentPlaceholder')}
+                                    {selectedAgentLabel || t('settings.commands.agentSelector.selectAgentPlaceholder')}
                                 </span>
                             </>
                         )}
@@ -164,7 +167,7 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
                 </button>
             ) : !isReady ? (
                 <div className={cn(
-                    dropdownTriggerVariants({ size: 'sm' }),
+                    dropdownTriggerVariants(),
                     'w-fit opacity-60',
                     className
                 )}>
@@ -177,12 +180,12 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
                 <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                         <div className={cn(
-                            dropdownTriggerVariants({ size: 'sm' }),
+                            dropdownTriggerVariants(),
                             'w-fit cursor-pointer',
                             className
                         )}>
                             <Icon name="robot-2" className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
-                            <span className="typography-micro min-w-0 flex-1 truncate text-left font-medium">
+                            <span className="typography-micro min-w-0 flex-1 truncate text-start font-medium">
                                 {agentName || t('settings.commands.agentSelector.notSelected')}
                             </span>
                             <Icon name="arrow-down-s" className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
@@ -201,7 +204,7 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
                                 className="typography-meta"
                                 onSelect={() => handleAgentChange(agent.name)}
                             >
-                                <span className="font-medium">{agent.name}</span>
+                                <span className="font-medium">{agentLabel(agent)}</span>
                             </DropdownMenuItem>
                         ))}
                     </DropdownMenuContent>

@@ -9,6 +9,7 @@ import {
   type ToolPart,
 } from "@/lib/opencode/model"
 import { Binary } from "./binary"
+import { withoutUnshownResult } from "@/lib/opencode/toolContentShells"
 import type { State } from "./types"
 import { dropSessionCaches } from "./session-cache"
 import { syncDebug } from "./debug"
@@ -211,7 +212,8 @@ function applyMessagePatch(message: Message, patch: MessagePatch): Message {
     // A completion the server reports supersedes the local interruption mark
     // (`interruptedTurnToolParts`); a turn that really failed arrives with its
     // own error in the same patch.
-    else if (patch.time?.completed !== undefined && message.error?.type === "aborted") delete next.error
+    else if (patch.time?.completed !== undefined && message.closedLocally) delete next.error
+    if (patch.error !== undefined || patch.time?.completed !== undefined) delete next.closedLocally
     if (patch.cost !== undefined) next.cost = patch.cost
     if (patch.tokens !== undefined) next.tokens = patch.tokens
     if (patch.snapshot) next.snapshot = compact({ ...message.snapshot, ...patch.snapshot })
@@ -225,6 +227,7 @@ function applyMessagePatch(message: Message, patch: MessagePatch): Message {
     if (patch.shell) {
       next.status = patch.shell.status
       if (patch.shell.exit !== undefined) next.exit = patch.shell.exit
+      if (patch.shell.signal !== undefined) next.signal = patch.shell.signal
       if (patch.shell.output !== undefined) next.output = patch.shell.output
     }
     return next
@@ -255,7 +258,7 @@ function applyToolTransition(part: ToolPart, transition: ToolTransition): ToolPa
       if (isFinalToolStatus(state.status)) return part
       const start = state.status === "running" ? state.time.start : transition.end
       const attachments = transition.attachments
-      return {
+      return withoutUnshownResult({
         ...part,
         executed: transition.executed,
         state: compact({
@@ -266,12 +269,12 @@ function applyToolTransition(part: ToolPart, transition: ToolTransition): ToolPa
           time: { start, end: transition.end },
           attachments,
         }),
-      }
+      })
     }
     case "failed": {
       if (isFinalToolStatus(state.status)) return part
       const start = state.status === "running" ? state.time.start : transition.end
-      return {
+      return withoutUnshownResult({
         ...part,
         executed: transition.executed,
         state: compact({
@@ -282,7 +285,7 @@ function applyToolTransition(part: ToolPart, transition: ToolTransition): ToolPa
           metadata: transition.metadata ?? (state.status === "running" ? state.metadata : undefined),
           time: { start, end: transition.end },
         }),
-      }
+      })
     }
   }
 }
@@ -358,6 +361,7 @@ export function applyDirectoryEvent(
       if (next.time.archived && !sessions[result.index].time.archived) {
         sessions.splice(result.index, 1)
         cleanupSessionCaches(draft, sessionID)
+        draft.sessionStatusInvalidated = { ...draft.sessionStatusInvalidated, [sessionID]: true }
         if (!next.parentID) draft.sessionTotal = Math.max(0, draft.sessionTotal - 1)
         markSessionEvent(sessionID, true)
         return true
@@ -406,6 +410,10 @@ export function applyDirectoryEvent(
       const info = result.found ? sessions[result.index] : undefined
       if (result.found) sessions.splice(result.index, 1)
       cleanupSessionCaches(draft, sessionID)
+      if (draft.sessionStatusInvalidated?.[sessionID]) {
+        draft.sessionStatusInvalidated = { ...draft.sessionStatusInvalidated }
+        delete draft.sessionStatusInvalidated[sessionID]
+      }
       if (!info?.parentID) draft.sessionTotal = Math.max(0, draft.sessionTotal - 1)
       markSessionEvent(sessionID, true)
       return true
@@ -413,8 +421,13 @@ export function applyDirectoryEvent(
 
     case "session.status": {
       const { sessionID, status } = event.properties
+      const wasInvalidated = draft.sessionStatusInvalidated?.[sessionID] === true
+      if (wasInvalidated) {
+        draft.sessionStatusInvalidated = { ...draft.sessionStatusInvalidated }
+        delete draft.sessionStatusInvalidated[sessionID]
+      }
       if (areSessionStatusesEqual(draft.session_status[sessionID], status)) {
-        return false
+        return wasInvalidated
       }
       draft.session_status[sessionID] = status
       return true
@@ -425,8 +438,13 @@ export function applyDirectoryEvent(
       // An error ends the turn; it is not a lasting status.
       const { sessionID } = event.properties
       const status = { type: "idle" } as const
+      const wasInvalidated = draft.sessionStatusInvalidated?.[sessionID] === true
+      if (wasInvalidated) {
+        draft.sessionStatusInvalidated = { ...draft.sessionStatusInvalidated }
+        delete draft.sessionStatusInvalidated[sessionID]
+      }
       if (areSessionStatusesEqual(draft.session_status[sessionID], status)) {
-        return false
+        return wasInvalidated
       }
       draft.session_status[sessionID] = status
       return true
@@ -739,18 +757,21 @@ export function applyDirectoryEvent(
 
 function trimSessions(draft: State) {
   if (draft.session.length <= draft.limit) return
-  // Keep sessions that have pending permissions (they need to stay visible)
-  const hasPermission = new Set(
-    Object.entries(draft.permission ?? {})
-      .filter(([, perms]) => perms && perms.length > 0)
-      .map(([sessionID]) => sessionID),
-  )
-  while (draft.session.length > draft.limit) {
-    // Remove from the beginning (oldest by sorted ID)
-    const candidate = draft.session[0]
-    if (hasPermission.has(candidate.id)) break
-    draft.session.shift()
-  }
+  // Sessions with a pending permission or form stay and do not count toward
+  // the limit: the composer finds a subagent's requests through its parent
+  // link in this list.
+  const isBlocking = (sessionID: string) =>
+    (draft.permission[sessionID]?.length ?? 0) > 0 || (draft.form[sessionID]?.length ?? 0) > 0
+  // Drop the oldest by creation time. The array is sorted by id, and session
+  // ids descend with time, so its head holds the newest session: trimming by
+  // position evicted a just-created subagent before its requests arrived.
+  const trimmable = draft.session
+    .filter((session) => !isBlocking(session.id))
+    .sort((a, b) => a.time.created - b.time.created)
+  const excess = trimmable.length - draft.limit
+  if (excess <= 0) return
+  const dropped = new Set(trimmable.slice(0, excess).map((session) => session.id))
+  draft.session = draft.session.filter((session) => !dropped.has(session.id))
 }
 
 function cleanupSessionCaches(draft: State, sessionID: string) {

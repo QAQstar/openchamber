@@ -1,4 +1,5 @@
-import { MCP_PROTOCOLS, type McpDraft, type McpProtocol } from '@/stores/useMcpConfigStore';
+import { MCP_PROTOCOLS, type McpCodemodeChoice, type McpDraft, type McpProtocol } from '@/stores/useMcpConfigStore';
+import { normalizeImportedMcpServerName } from './mcpDraft';
 
 export interface ImportedMcpResult {
   readonly ok: true;
@@ -18,7 +19,7 @@ export interface ImportedMcpResult {
   readonly timeoutStartup: string;
   readonly timeoutCatalog: string;
   readonly timeoutExecution: string;
-  readonly codemode: boolean;
+  readonly codemode: McpCodemodeChoice;
   readonly disabled: boolean;
   /** Absent in the paste means legacy, as OpenCode reads it. */
   readonly protocol: McpProtocol;
@@ -89,8 +90,7 @@ function buildResult(
     timeoutStartup: timeouts.startup,
     timeoutCatalog: timeouts.catalog,
     timeoutExecution: timeouts.execution,
-    // OpenCode treats an absent `codemode` as enabled.
-    codemode: raw.codemode !== false,
+    codemode: raw.codemode === true ? 'on' : raw.codemode === false ? 'off' : 'default',
     disabled: buildDisabled(raw),
     protocol: MCP_PROTOCOLS.find((candidate) => candidate === raw.protocol) ?? 'legacy',
   };
@@ -374,7 +374,7 @@ export function applyImportedMcpToDraft(
   options?: { isNewServer?: boolean },
 ): Partial<McpDraft> & { name: string } {
   const isNew = options?.isNewServer ?? false;
-  const importedName = result.name;
+  const importedName = result.name ? normalizeImportedMcpServerName(result.name) : undefined;
   const name = isNew && importedName ? importedName : currentDraft.name ?? '';
 
   const draft: Partial<McpDraft> & { name: string } = {

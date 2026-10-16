@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { parseImportedMcpSnippet } from './mcpImport';
+import { applyImportedMcpToDraft, parseImportedMcpSnippet } from './mcpImport';
 
 describe('parseImportedMcpSnippet', () => {
   test('imports OpenCode mcp wrapper config', () => {
@@ -73,7 +73,7 @@ describe('parseImportedMcpSnippet', () => {
     if (!result.ok) throw new Error(result.error);
     expect(result.name).toBe('nativeRemote');
     expect(result.disabled).toBe(true);
-    expect(result.codemode).toBe(true);
+    expect(result.codemode).toBe('on');
     expect(result.timeoutCatalog).toBe('30000');
     expect(result.timeoutExecution).toBe('45000');
     expect(result.oauthEnabled).toBe(true);
@@ -84,10 +84,10 @@ describe('parseImportedMcpSnippet', () => {
     expect(result.protocol).toBe('auto');
   });
 
-  test('a paste without codemode reads as enabled, the way OpenCode treats it', () => {
+  test('a paste without codemode leaves the choice to OpenCode', () => {
     const result = parseImportedMcpSnippet(JSON.stringify({ mcp: { servers: { plain: { type: 'remote', url: 'https://x.example/mcp' } } } }));
     if (!result.ok) throw new Error(result.error);
-    expect(result.codemode).toBe(true);
+    expect(result.codemode).toBe('default');
     expect(result.protocol).toBe('legacy');
   });
 
@@ -141,5 +141,32 @@ describe('parseImportedMcpSnippet', () => {
     if (result.ok) throw new Error('Expected import to fail');
     expect(result.error).toContain('Paste one server at a time');
     expect(result.error).toContain('servers in mcp');
+  });
+});
+
+describe('applyImportedMcpToDraft', () => {
+  test('a new server takes the imported name in the form the config accepts', () => {
+    const result = parseImportedMcpSnippet(JSON.stringify({
+      mcpServers: {
+        Roblox_Studio: { command: 'cmd.exe', args: ['/c', 'cd /d %LOCALAPPDATA%\\Roblox && .\\mcp.bat'] },
+      },
+    }));
+    if (!result.ok) throw new Error(result.error);
+
+    expect(applyImportedMcpToDraft(result, { name: '' }, { isNewServer: true }).name).toBe('roblox_studio');
+  });
+
+  test('separators and spaces at the edges of an imported name are dropped', () => {
+    const result = parseImportedMcpSnippet(JSON.stringify({ mcpServers: { ' My Server_ ': { command: 'x' } } }));
+    if (!result.ok) throw new Error(result.error);
+
+    expect(applyImportedMcpToDraft(result, { name: '' }, { isNewServer: true }).name).toBe('my-server');
+  });
+
+  test('an existing server keeps its name', () => {
+    const result = parseImportedMcpSnippet(JSON.stringify({ mcpServers: { Other: { command: 'x' } } }));
+    if (!result.ok) throw new Error(result.error);
+
+    expect(applyImportedMcpToDraft(result, { name: 'current' }, { isNewServer: false }).name).toBe('current');
   });
 });

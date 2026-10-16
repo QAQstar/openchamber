@@ -110,6 +110,8 @@ function readMessage(message) {
   return {
     id: message.id,
     role,
+    created: Number.isFinite(message.time?.created) ? message.time.created : null,
+    completed: Number.isFinite(message.time?.completed) ? message.time.completed : null,
     transparent: isTransparent(message),
     // v2 has no `parentID` on a message: a turn is the run of messages between
     // one user message and the assistant reply that follows it, which is what
